@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Environments
+venv/
+.venv/
+env/
+.naion_venv/
+
+# Generated documents (regenerate from .md)
+*.pdf
+
+# Large / regenerable data
+data/raw/*.pkl
+data/raw/*.h5
+data/**/*.hdf5
+*.mph
+*.traj
+
+# Model checkpoints
+models/*.pt
+models/*.pkl
+
+# MACE / torch caches
+*.model
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db

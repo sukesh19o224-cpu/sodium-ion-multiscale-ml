@@ -1,0 +1,65 @@
+/* GitHub-flavored markdown print styling for Chrome headless PDF export */
+@page {
+  size: A4;
+  margin: 18mm 16mm;
+}
+
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+body {
+  font-family: -apple-system, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 11pt;
+  line-height: 1.55;
+  color: #1f2328;
+  max-width: 100%;
+  margin: 0;
+  word-wrap: break-word;
+}
+
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin: 1.2em 0 0.5em; }
+h1 { font-size: 1.9em; padding-bottom: .3em; border-bottom: 1px solid #d8dee4; }
+h2 { font-size: 1.45em; padding-bottom: .3em; border-bottom: 1px solid #d8dee4; }
+h3 { font-size: 1.2em; }
+h4 { font-size: 1.05em; }
+
+p { margin: 0 0 0.85em; }
+
+a { color: #0969da; text-decoration: none; }
+
+code {
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 85%;
+  background: #eff1f3;
+  padding: .2em .4em;
+  border-radius: 6px;
+}
+
+pre {
+  background: #f6f8fa;
+  border-radius: 6px;
+  padding: 14px;
+  overflow: auto;
+  font-size: 85%;
+  line-height: 1.45;
+  page-break-inside: avoid;
+}
+pre code { background: transparent; padding: 0; font-size: 100%; }
+
+blockquote {
+  margin: 0 0 0.85em;
+  padding: 0 1em;
+  color: #59636e;
+  border-left: .25em solid #d0d7de;
+}
+
+table { border-collapse: collapse; margin: 0 0 1em; display: block; overflow: auto; }
+th, td { border: 1px solid #d0d7de; padding: 6px 13px; }
+tr:nth-child(2n) { background: #f6f8fa; }
+
+ul, ol { margin: 0 0 0.85em; padding-left: 2em; }
+li { margin: .15em 0; }
+
+hr { height: 1px; border: 0; background: #d0d7de; margin: 1.6em 0; }
+
+h1, h2, h3 { page-break-after: avoid; }
+img, figure { page-break-inside: avoid; }
