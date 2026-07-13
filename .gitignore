@@ -28,6 +28,13 @@ models/*.pkl
 *.model
 .cache/
 
+# Secrets — NEVER commit (repo goes public at preprint)
+.env
+.env.*
+*.key
+secrets.yaml
+.pmgrc.yaml
+
 # OS
 .DS_Store
 Thumbs.db
