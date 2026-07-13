@@ -74,15 +74,22 @@ warnings.filterwarnings("ignore")
 EBOHR_TO_DEBYE = 2.5417464
 HARTREE_TO_EV = 27.211386
 
-# `eps` = experimental static dielectric constant (~25 C) of the neat solvent.
+# `eps` = experimental STATIC dielectric constant of the neat LIQUID solvent (25 C
+#         unless noted). This is a bulk-liquid property (NOT available from
+#         Materials Project, which stores crystal DFPT dielectrics).
+# Primary source: Xu, Chem. Rev. 104, 4303 (2004), "Nonaqueous Liquid Electrolytes
+#   for Lithium-Based Rechargeable Batteries" -- the canonical battery-solvent table.
+#   (FEC/TEP show minor source-to-source variation; verify against a 2nd ref at write-up.)
+# NOTE: EC melts at ~36 C, so its dielectric is conventionally quoted at 40 C
+#       (eps = 89.78), not 25 C -- flag this in the paper.
 # Chayambuka 2022's cell uses NaPF6 in EC:PC (50:50 w/w) -> EC and PC are priority.
 SOLVENTS: dict[str, dict] = {
-    "PC":  dict(smiles="CC1COC(=O)O1",     name="propylene carbonate",      family="carbonate", eps=64.9),
-    "EC":  dict(smiles="C1COC(=O)O1",      name="ethylene carbonate",       family="carbonate", eps=89.8),
-    "DMC": dict(smiles="COC(=O)OC",        name="dimethyl carbonate",       family="carbonate", eps=3.1),
-    "DME": dict(smiles="COCCOC",           name="1,2-dimethoxyethane",      family="ether",     eps=7.2),
-    "TEP": dict(smiles="CCOP(=O)(OCC)OCC", name="triethyl phosphate",       family="phosphate", eps=13.0),
-    "FEC": dict(smiles="O=C1OCC(F)O1",     name="fluoroethylene carbonate", family="additive",  eps=107.0),
+    "PC":  dict(smiles="CC1COC(=O)O1",     name="propylene carbonate",      family="carbonate", eps=64.9),   # 25 C
+    "EC":  dict(smiles="C1COC(=O)O1",      name="ethylene carbonate",       family="carbonate", eps=89.78),  # 40 C (solid at RT)
+    "DMC": dict(smiles="COC(=O)OC",        name="dimethyl carbonate",       family="carbonate", eps=3.107),  # 25 C
+    "DME": dict(smiles="COCCOC",           name="1,2-dimethoxyethane",      family="ether",     eps=7.20),   # 25 C
+    "TEP": dict(smiles="CCOP(=O)(OCC)OCC", name="triethyl phosphate",       family="phosphate", eps=13.0),   # 25 C
+    "FEC": dict(smiles="O=C1OCC(F)O1",     name="fluoroethylene carbonate", family="additive",  eps=107.0),  # ~25 C
 }
 
 BASIS = "def2-svp"   # bump to def2-TZVP for publication-grade numbers
