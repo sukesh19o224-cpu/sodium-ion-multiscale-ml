@@ -1,39 +1,37 @@
 """
 04_electrolyte_md.py
 ====================
-Solution-phase MD of a real Na-ion electrolyte: Na+ + PF6- + EC:PC solvent mix.
-Engine: MACE-MH-1 (spice_wB97M head) on GPU -- has Na AND high-level organic accuracy.
+Solution-phase MD of a real Na-ion electrolyte: (Na+ + PF6-) x N  +  EC:PC solvent mix.
+Engine: MACE-MH-1, `omol` head -- trained on OMol25 (tens of millions of DFT
+electrolyte configs incl. Na, at wB97M-V/def2-TZVPD). This is the electrolyte-
+appropriate head; the OMol25 -> Na-electrolyte approach is experimentally validated
+in Levine et al., arXiv:2603.20183.
 
-This is Layer 1b: the MD that gives Na+ SOLVATION STRUCTURE and (with long runs)
-the diffusion coefficient -> conductivity via Nernst-Einstein.
+This is Layer 1b: gives Na+ SOLVATION STRUCTURE (RDF) and, with a long enough run,
+the diffusion coefficient -> conductivity (Nernst-Einstein).
 
-Designed for Google Colab (free T4 GPU, ~13 GB RAM). Do NOT run on a low-RAM
-laptop -- loading torch + CUDA + MACE spikes system RAM.
+Runs on a free GPU (Colab T4 / Kaggle P100). CHECKPOINTS periodically, so a
+disconnect/crash never loses progress -- just re-run and it RESUMES.
 
-Pipeline (matches the physics you learned):
-  1. Build molecules (RDKit) and PACK into a periodic box (bulk liquid).
-  2. Load MACE-MH-1 -> gives energy + forces (the "force engine").
-  3. Set velocities to 300 K (temperature = atom jiggling).
-  4. EQUILIBRATE (Langevin NVT thermostat) -- let it settle, throw away.
-  5. PRODUCE (Langevin NVT) -- collect the trajectory.
-  6. ANALYZE: Na+ MSD -> diffusion; Na-O RDF -> solvation shell.
+Physics (what you learned):
+  build box -> MACE gives forces -> ASE Langevin (Verlet + thermostat) moves atoms
+  -> equilibrate (settle, discard) -> produce (collect) -> MSD -> D ; RDF -> solvation.
 
-Honest scope for a FIRST run: modest box + short trajectory = proof-of-concept
-(see solvation form, rough diffusion). A converged conductivity needs a bigger
-box + longer run + replicas + finite-size (Yeh-Hummer) correction.
-
-Usage (Colab):
-    !pip install mace-torch ase rdkit
+Usage:
+    !pip install mace-torch ase rdkit huggingface_hub
+    # small test (measure speed):
     !python src/04_electrolyte_md.py --n_solvent 16 --prod_steps 5000
+    # bigger, overnight-style (resumes if it dies):
+    !python src/04_electrolyte_md.py --n_ion_pairs 3 --n_solvent 60 --prod_steps 200000 \
+        --outdir results/md_big
 """
 
 from __future__ import annotations
-import argparse, time, warnings
+import argparse, json, time, warnings
 from pathlib import Path
 import numpy as np
 warnings.filterwarnings("ignore")
 
-# ---- solvent chemistry (EC:PC mix, matching Chayambuka's real cell) ----
 SMILES = {
     "EC":  "C1COC(=O)O1",
     "PC":  "CC1COC(=O)O1",
@@ -41,12 +39,11 @@ SMILES = {
 }
 MACE_REPO = "mace-foundations/mace-mh-1"
 MACE_FILE = "mace-mh-1.model"
-MACE_HEAD = "spice_wB97M"   # high-level organic head (has Na)
+MACE_HEAD = "omol"   # OMol25 head -- the electrolyte-appropriate one (has Na)
 
 
 # --------------------------------------------------------------------------- #
 def build_mol(smiles, seed=1):
-    """SMILES -> (symbols, centered coords) via RDKit + MMFF."""
     from rdkit import Chem
     from rdkit.Chem import AllChem
     m = Chem.AddHs(Chem.MolFromSmiles(smiles))
@@ -62,7 +59,6 @@ def build_mol(smiles, seed=1):
 
 
 def random_rotation(xyz, rng):
-    """Apply a random 3D rotation (so molecules aren't all aligned)."""
     a, b, c = rng.uniform(0, 2*np.pi, 3)
     Rz = np.array([[np.cos(a),-np.sin(a),0],[np.sin(a),np.cos(a),0],[0,0,1]])
     Ry = np.array([[np.cos(b),0,np.sin(b)],[0,1,0],[-np.sin(b),0,np.cos(b)]])
@@ -70,23 +66,37 @@ def random_rotation(xyz, rng):
     return xyz @ (Rz @ Ry @ Rx).T
 
 
-def build_box(n_solvent, ratio_ec=0.5, seed=0):
+AMU_TO_G = 1.66053907e-24        # g per amu
+CM3_TO_A3 = 1.0e24               # A^3 per cm^3
+
+
+def target_box_length(atoms, density_g_cm3):
+    """Cubic box length that gives the requested LIQUID density (g/cm^3)."""
+    mass_g = atoms.get_masses().sum() * AMU_TO_G
+    volume_A3 = (mass_g / density_g_cm3) * CM3_TO_A3
+    return volume_A3 ** (1/3)
+
+
+def build_box(n_ion_pairs, n_solvent, ratio_ec=0.5, seed=0, density=1.25):
     """
-    Pack Na+ + PF6- + n_solvent (EC:PC) onto a grid inside a cubic PBC box.
-    Grid placement guarantees no atom overlap (one molecule per cell).
+    Pack n_ion_pairs*(Na+ + PF6-) + n_solvent (EC:PC) into a cubic PBC box.
+
+    Built DILUTE on a grid (guarantees no overlap), but the box is later
+    COMPRESSED to `density` (real EC:PC liquid ~1.2-1.3 g/cm^3) during
+    equilibration. A dilute box is a GAS, not a liquid -- density matters
+    enormously for diffusion, so we must reach real liquid density.
     """
     from ase import Atoms
     rng = np.random.default_rng(seed)
 
-    # species list: Na, PF6, then solvents (EC or PC by ratio)
     n_ec = int(round(n_solvent * ratio_ec))
-    species = ["Na", "PF6"] + ["EC"]*n_ec + ["PC"]*(n_solvent - n_ec)
+    species = (["Na"]*n_ion_pairs + ["PF6"]*n_ion_pairs
+               + ["EC"]*n_ec + ["PC"]*(n_solvent - n_ec))
     n_sites = len(species)
 
-    # cubic grid big enough to hold all sites; cell spacing avoids overlap
     ncell = int(np.ceil(n_sites ** (1/3)))
-    spacing = 7.5                      # A between molecule centers (no overlap)
-    L = ncell * spacing               # box length
+    spacing = 7.5                       # dilute start: no overlap
+    L0 = ncell * spacing
     cells = [(i, j, k) for i in range(ncell) for j in range(ncell)
              for k in range(ncell)][:n_sites]
     rng.shuffle(cells)
@@ -97,23 +107,62 @@ def build_box(n_solvent, ratio_ec=0.5, seed=0):
         if sp == "Na":
             symbols.append("Na"); positions.append(center[None, :])
         else:
-            s, x = build_mol(SMILES[sp if sp in SMILES else sp], seed=rng.integers(1e6))
+            s, x = build_mol(SMILES[sp], seed=rng.integers(1e6))
             symbols += s
             positions.append(random_rotation(x, rng) + center)
     positions = np.vstack(positions)
 
-    atoms = Atoms(symbols=symbols, positions=positions,
-                  cell=[L, L, L], pbc=True)
-    print(f"  box: {n_sites} species -> {len(atoms)} atoms, "
-          f"cubic L={L:.1f} A (Na+ + PF6- + {n_ec} EC + {n_solvent-n_ec} PC)")
-    return atoms
+    atoms = Atoms(symbols=symbols, positions=positions, cell=[L0, L0, L0], pbc=True)
+    L_target = target_box_length(atoms, density)
+    rho0 = (atoms.get_masses().sum()*AMU_TO_G) / ((L0**3)/CM3_TO_A3)
+    print(f"  box: {n_ion_pairs} NaPF6 + {n_ec} EC + {n_solvent-n_ec} PC "
+          f"-> {len(atoms)} atoms")
+    print(f"  start L={L0:.1f} A (rho={rho0:.2f} g/cm3, dilute) "
+          f"-> compress to L={L_target:.1f} A (rho={density:.2f} g/cm3, liquid)")
+    return atoms, L_target
+
+
+def compress_to_density(atoms, dyn, L_target, n_steps, report=None):
+    """
+    Gradually squeeze the cell from its current size to L_target while running MD.
+    Scaling positions with the cell avoids creating overlaps abruptly.
+    """
+    L0 = atoms.cell.lengths()[0]
+    for i in range(n_steps):
+        f = (i + 1) / n_steps
+        L = L0 + (L_target - L0) * f
+        scale = L / atoms.cell.lengths()[0]
+        atoms.set_cell(atoms.cell * scale, scale_atoms=True)   # squeeze + move atoms
+        dyn.run(1)
+        if report and (i + 1) % report == 0:
+            print(f"    compressing: L={L:.1f} A  T={atoms.get_temperature():6.1f} K")
 
 
 def load_mace(device):
     from huggingface_hub import hf_hub_download
     from mace.calculators.foundations_models import mace_mp
     path = hf_hub_download(MACE_REPO, MACE_FILE)
+    print(f"  MACE-MH-1 head='{MACE_HEAD}' on {device}")
     return mace_mp(model=path, device=device, default_dtype="float32", head=MACE_HEAD)
+
+
+# ---- checkpointing (so a disconnect never loses progress) ------------------ #
+def save_checkpoint(out, atoms, done_steps):
+    from ase.io import write
+    write(str(out / "checkpoint.xyz"), atoms)          # positions
+    np.save(out / "checkpoint_vel.npy", atoms.get_velocities())  # velocities
+    (out / "checkpoint.json").write_text(json.dumps({"done_steps": int(done_steps)}))
+
+
+def load_checkpoint(out):
+    ck = out / "checkpoint.json"
+    if not ck.exists():
+        return None, 0
+    from ase.io import read
+    atoms = read(str(out / "checkpoint.xyz"))
+    atoms.set_velocities(np.load(out / "checkpoint_vel.npy"))
+    done = json.loads(ck.read_text())["done_steps"]
+    return atoms, done
 
 
 # --------------------------------------------------------------------------- #
@@ -122,85 +171,124 @@ def run(args):
     from ase import units
     from ase.md.langevin import Langevin
     from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
-    from ase.io import Trajectory
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device: {device} | torch {torch.__version__}")
     out = Path(args.outdir); out.mkdir(parents=True, exist_ok=True)
+    print(f"device: {device} | torch {torch.__version__}")
 
-    print("Building electrolyte box ...")
-    atoms = build_box(args.n_solvent, seed=args.seed)
+    # ---- resume or fresh start ----
+    ckpt_atoms, done_steps = load_checkpoint(out)
+    if ckpt_atoms is not None:
+        print(f"RESUMING from checkpoint at {done_steps}/{args.prod_steps} production steps")
+        atoms = ckpt_atoms
+        atoms.set_cell(ckpt_atoms.cell); atoms.set_pbc(True)
+    else:
+        print("Fresh start. Building electrolyte box ...")
+        atoms, L_target = build_box(args.n_ion_pairs, args.n_solvent,
+                                    seed=args.seed, density=args.density)
 
-    print("Loading MACE-MH-1 (spice head) ...")
     atoms.calc = load_mace(device)
+    na_idx = [i for i, s in enumerate(atoms.get_chemical_symbols()) if s == "Na"]
 
-    # temperature = atom jiggling: draw initial velocities at target T
-    MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature)
+    dt = args.timestep * units.fs
 
-    dt = args.timestep * units.fs           # ~1 fs, set by fastest vibration
+    # ---- fresh start: compress to LIQUID density, then equilibrate ----
+    if ckpt_atoms is None:
+        MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature)
+        # strong friction while compressing/equilibrating: dumps the excess heat
+        # released by bad initial contacts (this is why T ran hot before).
+        dyn = Langevin(atoms, timestep=dt, temperature_K=args.temperature,
+                       friction=args.equil_friction)
+
+        print(f"Compressing to liquid density over {args.compress_steps} steps ...")
+        t0 = time.time()
+        compress_to_density(atoms, dyn, L_target, args.compress_steps,
+                            report=max(args.compress_steps//5, 1))
+        rho = (atoms.get_masses().sum()*AMU_TO_G) / ((atoms.cell.lengths()[0]**3)/CM3_TO_A3)
+        print(f"  compressed: L={atoms.cell.lengths()[0]:.1f} A, rho={rho:.2f} g/cm3 "
+              f"({time.time()-t0:.0f}s)")
+
+        print(f"Equilibrating {args.equil_steps} steps at liquid density ...")
+        t0 = time.time()
+        for i in range(0, args.equil_steps, max(args.equil_steps//5, 1)):
+            dyn.run(min(max(args.equil_steps//5, 1), args.equil_steps - i))
+            print(f"    equil: T={atoms.get_temperature():6.1f} K")
+        print(f"  equilibration done ({time.time()-t0:.0f}s)")
+        save_checkpoint(out, atoms, 0)
+
+    # production thermostat: weaker friction (less perturbation of dynamics)
     dyn = Langevin(atoms, timestep=dt, temperature_K=args.temperature,
-                   friction=args.friction)  # Langevin = thermostat (heat bath)
+                   friction=args.friction)
 
-    # ---- equilibration (settle; discard) ----
-    print(f"Equilibrating {args.equil_steps} steps ...")
-    t0 = time.time()
-    dyn.run(args.equil_steps)
-    print(f"  equilibration done ({time.time()-t0:.0f}s, "
-          f"{(time.time()-t0)/max(args.equil_steps,1)*1000:.0f} ms/step)")
+    # ---- production (checkpointed) ----
+    track = out / "na_track.csv"
+    if ckpt_atoms is None and track.exists():
+        track.unlink()
+    print(f"Producing to {args.prod_steps} steps (currently {done_steps}) ...")
+    t0 = time.time(); done0 = done_steps
+    while done_steps < args.prod_steps:
+        dyn.run(1); done_steps += 1
+        if done_steps % args.sample_every == 0:
+            row = [done_steps * args.timestep]                    # time in fs
+            for i in na_idx:
+                row += list(atoms.positions[i])                   # unwrapped Na pos
+            with open(track, "a") as f:
+                f.write(",".join(f"{v:.5f}" for v in row) + "\n")
+        if done_steps % args.checkpoint_every == 0:
+            save_checkpoint(out, atoms, done_steps)
+            rate = (time.time()-t0)/max(done_steps-done0,1)*1000
+            print(f"  step {done_steps:7d}  T={atoms.get_temperature():6.1f} K  "
+                  f"{rate:.0f} ms/step  (checkpointed)")
+    save_checkpoint(out, atoms, done_steps)
+    print(f"  production done ({time.time()-t0:.0f}s)")
 
-    # ---- production (collect) ----
-    na_index = [i for i, s in enumerate(atoms.get_chemical_symbols()) if s == "Na"][0]
-    traj_path = out / "production.traj"
-    traj = Trajectory(str(traj_path), "w", atoms)
-    na_pos, times = [], []
-    print(f"Producing {args.prod_steps} steps ...")
-    t0 = time.time()
-    for step in range(args.prod_steps):
-        dyn.run(1)
-        if step % args.sample_every == 0:
-            traj.write()
-            na_pos.append(atoms.positions[na_index].copy())
-            times.append(step * args.timestep)     # fs
-            if step % (args.sample_every*20) == 0:
-                T = atoms.get_temperature()
-                print(f"  step {step:6d}  T={T:6.1f} K  "
-                      f"{(time.time()-t0)/max(step,1)*1000:.0f} ms/step")
-    traj.close()
-    prod_time = time.time() - t0
-    print(f"  production done ({prod_time:.0f}s, "
-          f"{prod_time/args.prod_steps*1000:.0f} ms/step)")
-
-    # ---- analysis: Na+ MSD -> rough diffusion (Einstein relation) ----
-    na_pos = np.array(na_pos); times = np.array(times)
-    msd = ((na_pos - na_pos[0])**2).sum(axis=1)     # A^2
-    np.savetxt(out / "na_msd.csv",
-               np.column_stack([times, msd]),
-               header="time_fs,msd_A2", delimiter=",", comments="")
-    # Einstein: MSD = 6 D t  ->  D = slope/6  (rough from a short run!)
-    if len(times) > 5:
-        slope = np.polyfit(times[len(times)//2:], msd[len(times)//2:], 1)[0]  # A^2/fs
-        D = slope / 6.0 * 1e-5   # A^2/fs -> cm^2/s  (1 A^2/fs = 1e-1 cm^2/s ... see note)
-        # unit note: 1 A^2/fs = 1e-16 m^2 / 1e-15 s = 0.1 m^2/s = 1e3 cm^2/s
-        D = slope / 6.0 * 1e3    # cm^2/s
-        print(f"\n  Na+ MSD final: {msd[-1]:.2f} A^2 over {times[-1]/1000:.1f} ps")
-        print(f"  rough D(Na+) ~ {D:.2e} cm^2/s   (SHORT run -- proof of concept only)")
-
-    print(f"\nSaved: {traj_path.name}, na_msd.csv  ->  {out}")
+    analyze(out, na_idx, atoms, args)
     print("=== electrolyte MD complete ===")
-    print("NOTE: this is a first proof-of-concept. For a real conductivity: bigger box,")
-    print("      longer run, several ions, replicas, Yeh-Hummer correction, xTB cross-check.")
+
+
+def analyze(out, na_idx, atoms, args):
+    """MSD (avg over Na+ ions) -> rough D; Na-O RDF -> solvation shell."""
+    track = out / "na_track.csv"
+    if not track.exists():
+        return
+    data = np.loadtxt(track, delimiter=",")
+    if data.ndim == 1 or len(data) < 10:
+        print("  (not enough samples for analysis)"); return
+    times = data[:, 0]                                   # fs
+    pos = data[:, 1:].reshape(len(data), len(na_idx), 3)  # (frames, n_ion, 3)
+    # MSD averaged over ions, referenced to start
+    msd = ((pos - pos[0])**2).sum(axis=2).mean(axis=1)    # A^2
+    np.savetxt(out / "na_msd.csv", np.column_stack([times, msd]),
+               header="time_fs,msd_A2", delimiter=",", comments="")
+    # Einstein: MSD = 6 D t  ->  D = slope/6 ;  1 A^2/fs = 0.1 cm^2/s
+    half = len(times)//2
+    slope = np.polyfit(times[half:], msd[half:], 1)[0]    # A^2/fs
+    D = (slope/6.0)*0.1                                    # cm^2/s
+    print(f"\n  Na+ MSD final: {msd[-1]:.2f} A^2 over {times[-1]/1000:.1f} ps "
+          f"({len(na_idx)} ions averaged)")
+    print(f"  rough D(Na+) ~ {D:.2e} cm^2/s")
+    print("  (short/small run = proof of concept; validate vs xTB + experiment,")
+    print("   apply Yeh-Hummer finite-size correction for the paper number.)")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--n_ion_pairs", type=int, default=1, help="number of Na+/PF6- pairs")
     p.add_argument("--n_solvent", type=int, default=16, help="number of solvent molecules")
-    p.add_argument("--temperature", type=float, default=300.0, help="target T (K)")
+    p.add_argument("--temperature", type=float, default=300.0)
     p.add_argument("--timestep", type=float, default=1.0, help="dt in fs")
-    p.add_argument("--friction", type=float, default=0.01, help="Langevin friction")
-    p.add_argument("--equil_steps", type=int, default=1000, help="equilibration steps")
-    p.add_argument("--prod_steps", type=int, default=5000, help="production steps")
-    p.add_argument("--sample_every", type=int, default=10, help="sample interval")
+    p.add_argument("--density", type=float, default=1.25,
+                   help="target LIQUID density g/cm3 (EC:PC ~1.2-1.3)")
+    p.add_argument("--friction", type=float, default=0.01, help="production friction")
+    p.add_argument("--equil_friction", type=float, default=0.05,
+                   help="stronger friction during compress/equil (dumps excess heat)")
+    p.add_argument("--compress_steps", type=int, default=2000,
+                   help="steps over which to squeeze to liquid density")
+    p.add_argument("--equil_steps", type=int, default=3000)
+    p.add_argument("--prod_steps", type=int, default=5000)
+    p.add_argument("--sample_every", type=int, default=10)
+    p.add_argument("--checkpoint_every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--outdir", type=str, default="results/md_electrolyte")
     run(p.parse_args())
