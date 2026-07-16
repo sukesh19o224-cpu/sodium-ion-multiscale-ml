@@ -177,8 +177,14 @@ def compress_to_density(atoms, dyn, L_target, n_steps, report=None):
         scale = L / atoms.cell.lengths()[0]
         atoms.set_cell(atoms.cell * scale, scale_atoms=True)   # squeeze + move atoms
         dyn.run(1)
+        T = atoms.get_temperature()
+        if T > 5000:                                            # blow-up guard
+            raise RuntimeError(
+                f"System exploded (T={T:.0f} K) during compression at L={L:.1f} A. "
+                f"Compression too fast or dt too big -- increase --compress_steps "
+                f"or lower --equil_timestep.")
         if report and (i + 1) % report == 0:
-            print(f"    compressing: L={L:.1f} A  T={atoms.get_temperature():6.1f} K")
+            print(f"    compressing: L={L:.1f} A  T={T:6.1f} K")
 
 
 def load_mace(device):
@@ -238,17 +244,23 @@ def run(args):
     atoms.calc = load_mace(device)
     na_idx = [i for i, s in enumerate(atoms.get_chemical_symbols()) if s == "Na"]
 
-    dt = args.timestep * units.fs
+    dt_prod = args.timestep * units.fs               # fast dt (4 fs w/ HMR) for PRODUCTION
+    dt_equil = args.equil_timestep * units.fs        # SMALL, SAFE dt for compress+equil
 
     # ---- fresh start: compress to LIQUID density, then equilibrate ----
+    # CRITICAL: compression shoves atoms hard (force spikes). A big dt "steps
+    # over" those spikes and the system EXPLODES (T -> millions of K). So we use
+    # a small, safe dt (1 fs) during compression+equilibration, and only switch
+    # to the fast dt (4 fs) for production, once the system is settled.
     if ckpt_atoms is None:
         MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature)
         # strong friction while compressing/equilibrating: dumps the excess heat
-        # released by bad initial contacts (this is why T ran hot before).
-        dyn = Langevin(atoms, timestep=dt, temperature_K=args.temperature,
+        # released by bad initial contacts.
+        dyn = Langevin(atoms, timestep=dt_equil, temperature_K=args.temperature,
                        friction=args.equil_friction)
 
-        print(f"Compressing to liquid density over {args.compress_steps} steps ...")
+        print(f"Compressing to liquid density over {args.compress_steps} steps "
+              f"(dt={args.equil_timestep} fs, safe) ...")
         t0 = time.time()
         compress_to_density(atoms, dyn, L_target, args.compress_steps,
                             report=max(args.compress_steps//5, 1))
@@ -264,8 +276,8 @@ def run(args):
         print(f"  equilibration done ({time.time()-t0:.0f}s)")
         save_checkpoint(out, atoms, 0)
 
-    # production thermostat: weaker friction (less perturbation of dynamics)
-    dyn = Langevin(atoms, timestep=dt, temperature_K=args.temperature,
+    # production: fast dt (HMR makes 4 fs stable once equilibrated) + weaker friction
+    dyn = Langevin(atoms, timestep=dt_prod, temperature_K=args.temperature,
                    friction=args.friction)
 
     # ---- production (checkpointed) ----
@@ -326,7 +338,9 @@ def main():
     p.add_argument("--n_solvent", type=int, default=16, help="number of solvent molecules")
     p.add_argument("--temperature", type=float, default=300.0)
     p.add_argument("--timestep", type=float, default=4.0,
-                   help="dt in fs (4 fs OK with HMR; use 1 fs if --hmr_factor 1)")
+                   help="PRODUCTION dt in fs (4 fs OK with HMR once equilibrated)")
+    p.add_argument("--equil_timestep", type=float, default=1.0,
+                   help="SMALL safe dt in fs for compression+equilibration (avoids blow-up)")
     p.add_argument("--hmr_factor", type=float, default=3.0,
                    help="hydrogen mass x this (3 -> dt~4fs, ~4x fewer steps). 1 = off")
     p.add_argument("--density", type=float, default=1.25,
