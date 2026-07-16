@@ -195,23 +195,57 @@ def load_mace(device):
     return mace_mp(model=path, device=device, default_dtype="float32", head=MACE_HEAD)
 
 
-# ---- checkpointing (so a disconnect never loses progress) ------------------ #
-def save_checkpoint(out, atoms, done_steps):
+# ---- checkpointing (survives disconnects; skips the 30-min setup on re-run) - #
+def _write_state(out, atoms, tag):
     from ase.io import write
-    write(str(out / "checkpoint.xyz"), atoms)          # positions
-    np.save(out / "checkpoint_vel.npy", atoms.get_velocities())  # velocities
+    write(str(out / f"{tag}.xyz"), atoms)
+    np.save(out / f"{tag}_vel.npy", atoms.get_velocities())
+
+
+def _read_state(out, tag):
+    if not (out / f"{tag}.xyz").exists():
+        return None
+    from ase.io import read
+    atoms = read(str(out / f"{tag}.xyz"))
+    atoms.set_velocities(np.load(out / f"{tag}_vel.npy"))
+    atoms.set_pbc(True)
+    return atoms
+
+
+def _is_sane(atoms):
+    """Reject an exploded state (absurd velocities) so we never resume garbage."""
+    if atoms is None:
+        return False
+    v = np.linalg.norm(atoms.get_velocities(), axis=1)
+    return np.isfinite(v).all() and v.max() < 5.0     # A/fs; ~5 is already very hot
+
+
+def save_equilibrated(out, atoms):
+    """Permanent post-equilibration snapshot -- NEVER overwritten by production."""
+    _write_state(out, atoms, "equilibrated")
+
+
+def save_checkpoint(out, atoms, done_steps):
+    _write_state(out, atoms, "checkpoint")
     (out / "checkpoint.json").write_text(json.dumps({"done_steps": int(done_steps)}))
 
 
-def load_checkpoint(out):
+def load_resume(out):
+    """
+    Decide where to start:
+      1. a SANE production checkpoint -> continue production from there
+      2. else the equilibrated snapshot -> start production at 0 (skip setup)
+      3. else None -> fresh (build + compress + equilibrate)
+    """
     ck = out / "checkpoint.json"
-    if not ck.exists():
-        return None, 0
-    from ase.io import read
-    atoms = read(str(out / "checkpoint.xyz"))
-    atoms.set_velocities(np.load(out / "checkpoint_vel.npy"))
-    done = json.loads(ck.read_text())["done_steps"]
-    return atoms, done
+    if ck.exists():
+        atoms = _read_state(out, "checkpoint")
+        if _is_sane(atoms):
+            return atoms, json.loads(ck.read_text())["done_steps"], "checkpoint"
+    equil = _read_state(out, "equilibrated")
+    if _is_sane(equil):
+        return equil, 0, "equilibrated"
+    return None, 0, "fresh"
 
 
 # --------------------------------------------------------------------------- #
@@ -225,12 +259,15 @@ def run(args):
     out = Path(args.outdir); out.mkdir(parents=True, exist_ok=True)
     print(f"device: {device} | torch {torch.__version__}")
 
-    # ---- resume or fresh start ----
-    ckpt_atoms, done_steps = load_checkpoint(out)
-    if ckpt_atoms is not None:
-        print(f"RESUMING from checkpoint at {done_steps}/{args.prod_steps} production steps")
-        atoms = ckpt_atoms
-        atoms.set_cell(ckpt_atoms.cell); atoms.set_pbc(True)
+    # ---- decide: resume production / resume from equilibrated / fresh ----
+    resume_atoms, done_steps, mode = load_resume(out)
+    if mode == "checkpoint":
+        print(f"RESUMING production at {done_steps}/{args.prod_steps} steps")
+        atoms = resume_atoms
+    elif mode == "equilibrated":
+        print("Found equilibrated snapshot -> SKIPPING setup, straight to production "
+              "(change --timestep freely, no re-equilibration needed)")
+        atoms = resume_atoms
     else:
         print("Fresh start. Building electrolyte box ...")
         atoms, L_target = build_box(args.n_ion_pairs, args.n_solvent,
@@ -252,7 +289,7 @@ def run(args):
     # over" those spikes and the system EXPLODES (T -> millions of K). So we use
     # a small, safe dt (1 fs) during compression+equilibration, and only switch
     # to the fast dt (4 fs) for production, once the system is settled.
-    if ckpt_atoms is None:
+    if mode == "fresh":
         MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature)
         # strong friction while compressing/equilibrating: dumps the excess heat
         # released by bad initial contacts.
@@ -274,6 +311,7 @@ def run(args):
             dyn.run(min(max(args.equil_steps//5, 1), args.equil_steps - i))
             print(f"    equil: T={atoms.get_temperature():6.1f} K")
         print(f"  equilibration done ({time.time()-t0:.0f}s)")
+        save_equilibrated(out, atoms)   # PERMANENT snapshot -> future runs skip setup
         save_checkpoint(out, atoms, 0)
 
     # production: fast dt (HMR makes 4 fs stable once equilibrated) + weaker friction
@@ -284,10 +322,17 @@ def run(args):
     track = out / "na_track.csv"
     if ckpt_atoms is None and track.exists():
         track.unlink()
-    print(f"Producing to {args.prod_steps} steps (currently {done_steps}) ...")
+    print(f"Producing to {args.prod_steps} steps (currently {done_steps}), "
+          f"dt={args.timestep} fs ...")
     t0 = time.time(); done0 = done_steps
     while done_steps < args.prod_steps:
         dyn.run(1); done_steps += 1
+        T = atoms.get_temperature()
+        if T > 5000:                                              # blow-up guard
+            raise RuntimeError(
+                f"Production exploded (T={T:.0f} K) at step {done_steps}. "
+                f"Production dt={args.timestep} fs is too big for this system. "
+                f"Re-run with a smaller --timestep (try 2, or 1 with --hmr_factor 1).")
         if done_steps % args.sample_every == 0:
             row = [done_steps * args.timestep]                    # time in fs
             for i in na_idx:
@@ -297,7 +342,7 @@ def run(args):
         if done_steps % args.checkpoint_every == 0:
             save_checkpoint(out, atoms, done_steps)
             rate = (time.time()-t0)/max(done_steps-done0,1)*1000
-            print(f"  step {done_steps:7d}  T={atoms.get_temperature():6.1f} K  "
+            print(f"  step {done_steps:7d}  T={T:6.1f} K  "
                   f"{rate:.0f} ms/step  (checkpointed)")
     save_checkpoint(out, atoms, done_steps)
     print(f"  production done ({time.time()-t0:.0f}s)")
@@ -337,12 +382,14 @@ def main():
     p.add_argument("--n_ion_pairs", type=int, default=1, help="number of Na+/PF6- pairs")
     p.add_argument("--n_solvent", type=int, default=16, help="number of solvent molecules")
     p.add_argument("--temperature", type=float, default=300.0)
-    p.add_argument("--timestep", type=float, default=4.0,
-                   help="PRODUCTION dt in fs (4 fs OK with HMR once equilibrated)")
+    p.add_argument("--timestep", type=float, default=1.0,
+                   help="PRODUCTION dt in fs. DEFAULT 1 fs = bulletproof (proven stable). "
+                        "For ~2x speed: --hmr_factor 4 --timestep 2 (standard HMR).")
     p.add_argument("--equil_timestep", type=float, default=1.0,
-                   help="SMALL safe dt in fs for compression+equilibration (avoids blow-up)")
-    p.add_argument("--hmr_factor", type=float, default=3.0,
-                   help="hydrogen mass x this (3 -> dt~4fs, ~4x fewer steps). 1 = off")
+                   help="safe dt in fs for compression+equilibration")
+    p.add_argument("--hmr_factor", type=float, default=1.0,
+                   help="hydrogen mass x this. 1 = OFF (safest). Use 4 with --timestep 2 "
+                        "for a proven ~2x speedup once you trust the run.")
     p.add_argument("--density", type=float, default=1.25,
                    help="target LIQUID density g/cm3 (EC:PC ~1.2-1.3)")
     p.add_argument("--friction", type=float, default=0.01, help="production friction")
