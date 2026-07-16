@@ -70,6 +70,49 @@ AMU_TO_G = 1.66053907e-24        # g per amu
 CM3_TO_A3 = 1.0e24               # A^3 per cm^3
 
 
+def apply_hmr(atoms, factor=3.0):
+    """
+    Hydrogen Mass Repartitioning (HMR): make each H heavier by `factor`, and
+    subtract the added mass from the heavy atom it's bonded to (TOTAL mass
+    conserved). Heavier H -> slower H vibration -> allows a LARGER timestep
+    (dt=4 fs instead of 1 fs) -> ~4x fewer steps for the same simulated time.
+
+    Physics: dt is limited by the fastest vibration (freq = sqrt(k/m)); the
+    lightest atom (H) sets it. Increasing m_H lowers that frequency. This
+    alters ONLY the fast vibrational modes -- the SLOW dynamics we measure
+    (diffusion, thermodynamics) are preserved. Standard, validated technique.
+
+    Uses a simple distance-based bond detection (H bonded to its nearest
+    non-H atom within 1.3 A).
+    """
+    from ase.data import atomic_numbers
+    masses = atoms.get_masses().copy()
+    symbols = atoms.get_chemical_symbols()
+    h_mass = 1.008
+    added = h_mass * (factor - 1.0)          # mass added to each H
+
+    pos = atoms.get_positions()
+    heavy = [i for i, s in enumerate(symbols) if s != "H"]
+    n_h = 0
+    for i, s in enumerate(symbols):
+        if s != "H":
+            continue
+        # nearest heavy atom = the one H is bonded to
+        d = np.linalg.norm(pos[heavy] - pos[i], axis=1)
+        j = heavy[int(np.argmin(d))]
+        if d.min() > 1.3:                    # not clearly bonded -> skip
+            continue
+        masses[i] = h_mass * factor          # heavier H
+        masses[j] -= added                   # take it from the bonded heavy atom
+        n_h += 1
+    if (masses <= 0).any():
+        raise ValueError("HMR produced a non-positive mass -- lower --hmr_factor")
+    atoms.set_masses(masses)
+    print(f"  HMR applied: {n_h} H atoms x{factor} (dt can now be ~4 fs) "
+          f"| total mass conserved: {masses.sum():.2f} amu")
+    return atoms
+
+
 def target_box_length(atoms, density_g_cm3):
     """Cubic box length that gives the requested LIQUID density (g/cm^3)."""
     mass_g = atoms.get_masses().sum() * AMU_TO_G
@@ -187,6 +230,11 @@ def run(args):
         atoms, L_target = build_box(args.n_ion_pairs, args.n_solvent,
                                     seed=args.seed, density=args.density)
 
+    # HMR is deterministic from the structure -> apply on BOTH fresh start and
+    # resume (the .xyz checkpoint doesn't store masses, so we must re-apply).
+    if args.hmr_factor > 1.0:
+        apply_hmr(atoms, factor=args.hmr_factor)   # heavier H -> allows bigger dt
+
     atoms.calc = load_mace(device)
     na_idx = [i for i, s in enumerate(atoms.get_chemical_symbols()) if s == "Na"]
 
@@ -277,7 +325,10 @@ def main():
     p.add_argument("--n_ion_pairs", type=int, default=1, help="number of Na+/PF6- pairs")
     p.add_argument("--n_solvent", type=int, default=16, help="number of solvent molecules")
     p.add_argument("--temperature", type=float, default=300.0)
-    p.add_argument("--timestep", type=float, default=1.0, help="dt in fs")
+    p.add_argument("--timestep", type=float, default=4.0,
+                   help="dt in fs (4 fs OK with HMR; use 1 fs if --hmr_factor 1)")
+    p.add_argument("--hmr_factor", type=float, default=3.0,
+                   help="hydrogen mass x this (3 -> dt~4fs, ~4x fewer steps). 1 = off")
     p.add_argument("--density", type=float, default=1.25,
                    help="target LIQUID density g/cm3 (EC:PC ~1.2-1.3)")
     p.add_argument("--friction", type=float, default=0.01, help="production friction")
