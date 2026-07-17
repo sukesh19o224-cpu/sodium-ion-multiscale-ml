@@ -320,7 +320,7 @@ def run(args):
 
     # ---- production (checkpointed) ----
     track = out / "na_track.csv"
-    if ckpt_atoms is None and track.exists():
+    if mode != "checkpoint" and track.exists():   # fresh/equilibrated start -> clear old track
         track.unlink()
     print(f"Producing to {args.prod_steps} steps (currently {done_steps}), "
           f"dt={args.timestep} fs ...")
